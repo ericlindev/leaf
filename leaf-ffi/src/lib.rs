@@ -257,6 +257,19 @@ pub extern "C" fn leaf_shutdown(rt_id: u16) -> bool {
     leaf::shutdown(rt_id)
 }
 
+/// Returns true if a leaf instance with the given runtime ID is currently running.
+///
+/// This is a lightweight, side-effect-free liveness check.
+/// It reflects runtime-manager registration state and must not be treated as a
+/// full readiness guarantee for packet I/O or startup completion.
+///
+/// @param rt_id The ID of the leaf instance to query.
+/// @return Returns true if the instance is running, false otherwise.
+#[no_mangle]
+pub extern "C" fn leaf_is_running(rt_id: u16) -> bool {
+    leaf::is_running(rt_id)
+}
+
 /// Initializes a runtime-scoped external packet tunnel for the TUN inbound.
 ///
 /// When this is set up before `leaf_run*`, Leaf will use packet queues instead of
@@ -298,7 +311,8 @@ pub extern "C" fn leaf_packet_tunnel_init(rt_id: u16, output_queue_size: usize) 
 ///
 /// The callback is edge-triggered. It fires when the Swift -> Leaf input queue transitions
 /// from full to non-full after `leaf_packet_tunnel_write` has returned `ERR_QUEUE_FULL`.
-/// It is not a close signal and is not guaranteed to fire after `leaf_packet_tunnel_close`.
+/// It is not a close signal. After `leaf_packet_tunnel_close` returns, the callback will
+/// no longer be invoked.
 /// The callback must return quickly and should schedule a retry of any locally buffered packets.
 ///
 /// @param rt_id The runtime ID associated with this packet tunnel.
@@ -325,6 +339,7 @@ pub extern "C" fn leaf_packet_tunnel_set_input_ready_callback(
 /// The callback is invoked when the outbound packet queue transitions from empty to non-empty.
 /// If packets are already queued when the callback is registered, the callback is invoked
 /// immediately so Swift can start draining without waiting for a new edge.
+/// After `leaf_packet_tunnel_close` returns, the callback will no longer be invoked.
 /// The callback must return quickly and should schedule a drain loop that repeatedly calls
 /// `leaf_packet_tunnel_read` until it returns ERR_NO_DATA.
 ///

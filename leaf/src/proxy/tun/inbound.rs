@@ -571,6 +571,18 @@ pub fn new(
         None
     };
 
+    // Validate feature availability before consuming the packet tunnel transport.
+    if super::packet_io::has_runtime_packet_tunnel(rt_id) {
+        #[cfg(not(feature = "netstack-smoltcp"))]
+        if settings.tun2socks.as_str() == "smoltcp" {
+            return Err(anyhow!("netstack-smoltcp feature is not enabled"));
+        }
+        #[cfg(not(feature = "netstack-lwip"))]
+        if settings.tun2socks.as_str() != "smoltcp" {
+            return Err(anyhow!("netstack-lwip feature is not enabled"));
+        }
+    }
+
     if let Some(packet_tunnel) = super::packet_io::take_runtime_packet_tunnel(rt_id)
         .map_err(|e| anyhow!("take packet tunnel failed: {}", e))?
     {

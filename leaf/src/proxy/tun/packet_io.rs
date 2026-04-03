@@ -3,8 +3,8 @@ use std::{
     ffi::c_void,
     io::{self, ErrorKind},
     sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, Condvar, Mutex,
     },
     task::{Context, Poll},
 };
@@ -16,6 +16,9 @@ use crate::{option, RuntimeId};
 
 type PacketQueue = Mutex<VecDeque<Vec<u8>>>;
 pub const MAX_PACKET_TUNNEL_QUEUE_SIZE: usize = 4_096;
+pub const DEFAULT_INPUT_BYTE_LIMIT: usize = 1 * 1024 * 1024; // 1 MB
+pub const DEFAULT_OUTPUT_BYTE_LIMIT: usize = 2 * 1024 * 1024; // 2 MB
+const MAX_IP_PACKET_SIZE: usize = u16::MAX as usize;
 
 struct OutputState {
     queue: VecDeque<Vec<u8>>,
@@ -141,21 +144,44 @@ struct PacketTunnelHandle {
     input_waker: AtomicWaker,
     input_ready_notifier: Mutex<Option<PacketTunnelNotifier>>,
     input_queue_limit: usize,
+    input_queued_bytes: AtomicUsize,
+    input_byte_limit: usize,
     output_state: Mutex<OutputState>,
     output_waker: AtomicWaker,
     output_ready_notifier: Mutex<Option<PacketTunnelNotifier>>,
     output_queue_limit: usize,
+    output_queued_bytes: AtomicUsize,
+    output_byte_limit: usize,
+    callbacks_in_flight: Mutex<usize>,
+    callbacks_drained: Condvar,
     connected: AtomicBool,
     closed: AtomicBool,
 }
 
+struct CallbackGuard<'a> {
+    handle: &'a PacketTunnelHandle,
+}
+
+impl Drop for CallbackGuard<'_> {
+    fn drop(&mut self) {
+        self.handle.finish_callback();
+    }
+}
+
 impl PacketTunnelHandle {
-    fn new(input_queue_limit: usize, output_queue_limit: usize) -> Self {
+    fn new(
+        input_queue_limit: usize,
+        output_queue_limit: usize,
+        input_byte_limit: usize,
+        output_byte_limit: usize,
+    ) -> Self {
         Self {
             input_queue: Mutex::new(VecDeque::new()),
             input_waker: AtomicWaker::new(),
             input_ready_notifier: Mutex::new(None),
             input_queue_limit,
+            input_queued_bytes: AtomicUsize::new(0),
+            input_byte_limit,
             output_state: Mutex::new(OutputState {
                 queue: VecDeque::new(),
                 pending: None,
@@ -163,6 +189,10 @@ impl PacketTunnelHandle {
             output_waker: AtomicWaker::new(),
             output_ready_notifier: Mutex::new(None),
             output_queue_limit,
+            output_queued_bytes: AtomicUsize::new(0),
+            output_byte_limit: output_byte_limit.max(MAX_IP_PACKET_SIZE),
+            callbacks_in_flight: Mutex::new(0),
+            callbacks_drained: Condvar::new(),
             connected: AtomicBool::new(false),
             closed: AtomicBool::new(false),
         }
@@ -182,27 +212,62 @@ impl PacketTunnelHandle {
 
     fn close(&self) {
         self.closed.store(true, Ordering::Release);
+        *self.input_ready_notifier.lock().unwrap() = None;
+        *self.output_ready_notifier.lock().unwrap() = None;
+        self.wait_for_callbacks();
         self.input_waker.wake();
         self.output_waker.wake();
+    }
+
+    fn begin_callback(&self) -> Option<CallbackGuard<'_>> {
+        let mut callbacks_in_flight = self.callbacks_in_flight.lock().unwrap();
+        if self.closed.load(Ordering::Acquire) {
+            return None;
+        }
+        *callbacks_in_flight += 1;
+        Some(CallbackGuard { handle: self })
+    }
+
+    fn finish_callback(&self) {
+        let mut callbacks_in_flight = self.callbacks_in_flight.lock().unwrap();
+        *callbacks_in_flight -= 1;
+        if *callbacks_in_flight == 0 {
+            self.callbacks_drained.notify_all();
+        }
+    }
+
+    fn wait_for_callbacks(&self) {
+        let mut callbacks_in_flight = self.callbacks_in_flight.lock().unwrap();
+        while *callbacks_in_flight > 0 {
+            callbacks_in_flight = self.callbacks_drained.wait(callbacks_in_flight).unwrap();
+        }
     }
 
     fn pop_input_packet(&self) -> Option<Vec<u8>> {
         let (packet, should_notify) = {
             let mut queue = self.input_queue.lock().unwrap();
-            let was_full = queue.len() >= self.input_queue_limit;
+            let was_count_full = queue.len() >= self.input_queue_limit;
+            let was_byte_full =
+                self.input_queued_bytes.load(Ordering::Relaxed) >= self.input_byte_limit;
+            let was_full = was_count_full || was_byte_full;
             let packet = queue.pop_front();
-            let should_notify =
-                packet.is_some() && was_full && queue.len() < self.input_queue_limit;
+            if let Some(ref p) = packet {
+                self.input_queued_bytes
+                    .fetch_sub(p.len(), Ordering::Relaxed);
+            }
+            let now_count_full = queue.len() >= self.input_queue_limit;
+            let now_byte_full =
+                self.input_queued_bytes.load(Ordering::Relaxed) >= self.input_byte_limit;
+            let should_notify = packet.is_some() && was_full && !(now_count_full || now_byte_full);
             (packet, should_notify)
         };
 
         if should_notify {
-            if self.closed.load(Ordering::Acquire) {
-                return packet;
-            }
-            let notifier = *self.input_ready_notifier.lock().unwrap();
-            if let Some(notifier) = notifier {
-                notifier.notify();
+            if let Some(_guard) = self.begin_callback() {
+                let notifier = *self.input_ready_notifier.lock().unwrap();
+                if let Some(notifier) = notifier {
+                    notifier.notify();
+                }
             }
         }
 
@@ -225,6 +290,16 @@ impl PacketTunnelHandle {
                     "packet tunnel input queue is full",
                 ));
             }
+            if self.input_queued_bytes.load(Ordering::Relaxed) + packet.len()
+                > self.input_byte_limit
+            {
+                return Err(io::Error::new(
+                    ErrorKind::WouldBlock,
+                    "packet tunnel input byte limit exceeded",
+                ));
+            }
+            self.input_queued_bytes
+                .fetch_add(packet.len(), Ordering::Relaxed);
             queue.push_back(packet);
         }
 
@@ -238,10 +313,16 @@ impl PacketTunnelHandle {
 
     fn output_has_capacity(&self) -> bool {
         let state = self.output_state.lock().unwrap();
-        state.queue.len() + usize::from(state.pending.is_some()) < self.output_queue_limit
+        let count_ok =
+            state.queue.len() + usize::from(state.pending.is_some()) < self.output_queue_limit;
+        // Reserve space for one full IP packet so `poll_ready` guarantees the next
+        // `start_send` cannot fail with `WouldBlock` due to byte pressure alone.
+        let queued_bytes = self.output_queued_bytes.load(Ordering::Relaxed);
+        let byte_ok = self.output_byte_limit.saturating_sub(queued_bytes) >= MAX_IP_PACKET_SIZE;
+        count_ok && byte_ok
     }
 
-    fn push_output_packet(&self, packet: Vec<u8>) -> io::Result<()> {
+    fn push_output_packet(&self, item: Vec<u8>) -> io::Result<()> {
         if self.closed.load(Ordering::Acquire) {
             return Err(io::Error::new(
                 ErrorKind::BrokenPipe,
@@ -257,15 +338,27 @@ impl PacketTunnelHandle {
                     "packet tunnel output queue is full",
                 ));
             }
+            if self.output_queued_bytes.load(Ordering::Relaxed) + item.len()
+                > self.output_byte_limit
+            {
+                return Err(io::Error::new(
+                    ErrorKind::WouldBlock,
+                    "packet tunnel output byte limit exceeded",
+                ));
+            }
+            self.output_queued_bytes
+                .fetch_add(item.len(), Ordering::Relaxed);
             let should_notify = state.queue.is_empty() && state.pending.is_none();
-            state.queue.push_back(packet);
+            state.queue.push_back(item);
             should_notify
         };
 
         if should_notify {
-            let notifier = *self.output_ready_notifier.lock().unwrap();
-            if let Some(notifier) = notifier {
-                notifier.notify();
+            if let Some(_guard) = self.begin_callback() {
+                let notifier = *self.output_ready_notifier.lock().unwrap();
+                if let Some(notifier) = notifier {
+                    notifier.notify();
+                }
             }
         }
         Ok(())
@@ -274,7 +367,9 @@ impl PacketTunnelHandle {
     fn set_output_ready_notifier(&self, notifier: Option<PacketTunnelNotifier>) {
         *self.output_ready_notifier.lock().unwrap() = notifier;
         if let Some(notifier) = notifier.filter(|_| self.has_output_ready()) {
-            notifier.notify();
+            if let Some(_guard) = self.begin_callback() {
+                notifier.notify();
+            }
         }
     }
 
@@ -298,6 +393,8 @@ impl PacketTunnelHandle {
         buffer[..len].copy_from_slice(packet);
         state.pending.take();
         drop(state);
+        // Decrement only after the packet is fully consumed (copied to the caller's buffer).
+        self.output_queued_bytes.fetch_sub(len, Ordering::Relaxed);
         self.output_waker.wake();
         Ok(RuntimePacketRead::Packet(len))
     }
@@ -364,9 +461,18 @@ pub fn init_runtime_packet_tunnel(
         ));
     }
 
-    let handle = Arc::new(PacketTunnelHandle::new(input_queue_size, output_queue_size));
+    let handle = Arc::new(PacketTunnelHandle::new(
+        input_queue_size,
+        output_queue_size,
+        DEFAULT_INPUT_BYTE_LIMIT,
+        DEFAULT_OUTPUT_BYTE_LIMIT,
+    ));
     tunnels.insert(rt_id, handle);
     Ok(())
+}
+
+pub fn has_runtime_packet_tunnel(rt_id: RuntimeId) -> bool {
+    PACKET_TUNNELS.lock().unwrap().contains_key(&rt_id)
 }
 
 pub fn take_runtime_packet_tunnel(rt_id: RuntimeId) -> io::Result<Option<PacketTunnelTransport>> {
@@ -596,5 +702,87 @@ mod tests {
         let counter = unsafe { Box::from_raw(counter_ptr) };
         assert_eq!(counter.load(Ordering::SeqCst), 0);
         drop(counter);
+    }
+
+    /// Writing one packet whose size alone exceeds the byte limit must return WouldBlock.
+    #[test]
+    fn write_returns_would_block_when_byte_limit_exceeded() {
+        // Use a very small byte limit (4 bytes) but a generous packet-count limit,
+        // so only the byte cap is the binding constraint.
+        let handle = Arc::new(PacketTunnelHandle::new(
+            128, // packet count limit — not the binding constraint
+            128, // output (unused)
+            4,   // input byte limit: 4 bytes
+            DEFAULT_OUTPUT_BYTE_LIMIT,
+        ));
+
+        // A 5-byte packet exceeds the 4-byte byte limit.
+        let large = vec![0u8; 5];
+        let err = handle.push_input_packet(large).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::WouldBlock);
+    }
+
+    /// When the queue is byte-limited (but not count-limited), popping a packet
+    /// must fire the input-ready notification.
+    #[test]
+    fn pop_triggers_notification_when_byte_limit_was_binding() {
+        let counter = Box::new(AtomicUsize::new(0));
+        let counter_ptr = Box::into_raw(counter);
+
+        // byte limit = 3 bytes; count limit = 100 packets (not the binding constraint).
+        let handle = Arc::new(PacketTunnelHandle::new(
+            100,
+            128,
+            3, // byte limit
+            DEFAULT_OUTPUT_BYTE_LIMIT,
+        ));
+
+        // Set the input-ready notifier.
+        handle.set_input_ready_notifier(Some(PacketTunnelNotifier {
+            rt_id: 0,
+            context: counter_ptr.cast(),
+            callback: count_notifications,
+        }));
+
+        // Push a 3-byte packet — this fills the byte limit exactly.
+        handle.push_input_packet(vec![1, 2, 3]).unwrap();
+
+        // A second push (even 1 byte) should be rejected because 3+1 > 3.
+        let err = handle.push_input_packet(vec![4]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::WouldBlock);
+
+        // Pop the packet — this should trigger the notification because the queue was
+        // byte-full before and is no longer byte-full after.
+        let popped = handle.pop_input_packet();
+        assert_eq!(popped, Some(vec![1, 2, 3]));
+
+        let counter = unsafe { Box::from_raw(counter_ptr) };
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+        drop(counter);
+    }
+
+    #[test]
+    fn output_capacity_reserves_space_for_one_max_packet() {
+        let handle = Arc::new(PacketTunnelHandle::new(
+            128,
+            128,
+            DEFAULT_INPUT_BYTE_LIMIT,
+            MAX_IP_PACKET_SIZE + 10,
+        ));
+        let mut tunnel = PacketTunnelTransport {
+            inner: handle.clone(),
+        };
+
+        futures::executor::block_on(async { tunnel.send(vec![0u8; 11]).await }).unwrap();
+
+        assert!(!handle.output_has_capacity());
+
+        let mut buffer = vec![0u8; 16];
+        match handle.read_output_packet(&mut buffer).unwrap() {
+            RuntimePacketRead::Packet(len) => assert_eq!(len, 11),
+            _ => panic!("expected packet"),
+        }
+
+        assert!(handle.output_has_capacity());
     }
 }
