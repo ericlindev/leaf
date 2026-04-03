@@ -13,7 +13,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     app::dispatcher::Dispatcher,
-    app::fake_dns::{FakeDns, FakeDnsMode},
+    app::fake_dns::FakeDns,
     app::nat_manager::NatManager,
     app::nat_manager::UdpPacket,
     config::{Inbound, TunInboundSettings},
@@ -549,27 +549,11 @@ pub fn new(
 
     let settings = TunInboundSettings::parse_from_bytes(&inbound.settings)?;
 
-    // FIXME it's a bad design to have 2 lists in config while we need only one
-    let fake_dns_exclude = settings.fake_dns_exclude;
-    let fake_dns_include = settings.fake_dns_include;
-    if !fake_dns_exclude.is_empty() && !fake_dns_include.is_empty() {
-        return Err(anyhow!(
-            "fake DNS run in either include mode or exclude mode"
-        ));
-    }
-    let fakedns = if !fake_dns_include.is_empty() {
-        Some(Arc::new(FakeDns::new(
-            FakeDnsMode::Include,
-            fake_dns_include,
-        )))
-    } else if !fake_dns_exclude.is_empty() {
-        Some(Arc::new(FakeDns::new(
-            FakeDnsMode::Exclude,
-            fake_dns_exclude,
-        )))
-    } else {
-        None
-    };
+    let fakedns = FakeDns::from_proto_settings(
+        settings.fake_dns_exclude,
+        settings.fake_dns_include,
+    )
+    .map_err(|e| anyhow!("invalid fake DNS configuration: {}", e))?;
 
     // Validate feature availability before consuming the packet tunnel transport.
     if super::packet_io::has_runtime_packet_tunnel(rt_id) {

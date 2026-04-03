@@ -93,6 +93,35 @@ fn test_config() {
     assert!(crate::config::json::json_from_string(json_str).is_ok());
 }
 
+/// Setting both fakeDnsExclude and fakeDnsInclude on the same inbound is a
+/// misconfiguration.  config parsing must reject it so the error surfaces
+/// before startup rather than at runtime.
+#[test]
+fn test_fake_dns_mutually_exclusive_nf_json() {
+    let json_str = r#"
+    {
+        "inbounds": [
+            {
+                "tag": "nf_in",
+                "protocol": "nf",
+                "settings": {
+                    "driverName": "WinDivert.dll",
+                    "fakeDnsExclude": ["real.example.com"],
+                    "fakeDnsInclude": ["fake.example.com"]
+                }
+            }
+        ]
+    }
+    "#;
+    let err = crate::config::json::from_string(json_str)
+        .expect_err("config with both fakeDnsExclude and fakeDnsInclude must fail");
+    assert!(
+        err.to_string().contains("mutually exclusive"),
+        "unexpected error message: {}",
+        err
+    );
+}
+
 #[test]
 fn test_invalid_config() {
     // Missing protocol

@@ -138,14 +138,16 @@ impl InboundManager {
                     let settings: crate::config::NfInboundSettings =
                         protobuf::Message::parse_from_bytes(&inbound.settings)?;
                     use crate::app::fake_dns::{FakeDns, FakeDnsMode};
-                    let fake_dns_exclude = settings.fake_dns_exclude.clone();
-                    let fake_dns_include = settings.fake_dns_include.clone();
-                    let (mode, filters) = if !fake_dns_include.is_empty() {
-                        (FakeDnsMode::Include, fake_dns_include)
-                    } else {
-                        (FakeDnsMode::Exclude, fake_dns_exclude)
-                    };
-                    let fake_dns = Arc::new(FakeDns::new(mode, filters));
+                    let fake_dns = FakeDns::from_proto_settings(
+                        settings.fake_dns_exclude.clone(),
+                        settings.fake_dns_include.clone(),
+                    )?
+                    // NfManager always requires a FakeDns instance; an unconfigured
+                    // fake DNS defaults to exclude-mode with an empty filter list,
+                    // which accepts all domains (no domain is excluded).
+                    .unwrap_or_else(|| {
+                        Arc::new(FakeDns::new(FakeDnsMode::Exclude, Vec::new()))
+                    });
                     let manager = Arc::new(nf::inbound::NfManager::new(
                         settings.driver_name.clone(),
                         settings.nfapi.clone(),

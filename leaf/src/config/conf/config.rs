@@ -1970,6 +1970,33 @@ CERT4
         assert_eq!(certs.get("MyThirdCert").unwrap(), "CERT3\n");
         assert_eq!(certs.get("NoSpaceCert").unwrap(), "CERT4\n");
     }
+
+    /// Supplying both always-real-ip and always-fake-ip in the same [General]
+    /// section is a misconfiguration.  to_internal must reject it so the error
+    /// surfaces at config-parse time (leaf_test_config, startup) rather than
+    /// silently at runtime.
+    ///
+    /// Uses the NF inbound path because it has no platform cfg-gate in
+    /// common::to_internal, making the test run on every CI target.
+    #[test]
+    fn test_fake_dns_mutually_exclusive_conf_nf() {
+        let conf = r#"
+[General]
+nf = WinDivert.dll
+always-real-ip = real.example.com
+always-fake-ip = fake.example.com
+"#;
+        let lines: Vec<io::Result<String>> =
+            conf.lines().map(|s| Ok(s.to_string())).collect();
+        let config = from_lines(lines).unwrap();
+        let err = to_internal(&config)
+            .expect_err("config with both always-real-ip and always-fake-ip must fail");
+        assert!(
+            err.to_string().contains("mutually exclusive"),
+            "unexpected error message: {}",
+            err
+        );
+    }
 }
 
 pub fn from_file<P>(path: P) -> Result<internal::Config>

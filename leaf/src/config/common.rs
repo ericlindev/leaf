@@ -607,24 +607,18 @@ pub fn to_internal(mut config: Config) -> Result<internal::Config> {
                     inbound.protocol = "tun".to_string();
                     if let Some(ext_settings) = ext_settings {
                         let mut settings = internal::TunInboundSettings::new();
-                        let mut fake_dns_exclude = Vec::new();
-                        if let Some(ext_excludes) = &ext_settings.fake_dns_exclude {
-                            for ext_exclude in ext_excludes {
-                                fake_dns_exclude.push(ext_exclude.clone());
-                            }
-                        }
-                        if !fake_dns_exclude.is_empty() {
-                            settings.fake_dns_exclude = fake_dns_exclude;
-                        }
-
-                        let mut fake_dns_include = Vec::new();
-                        if let Some(ext_includes) = &ext_settings.fake_dns_include {
-                            for ext_include in ext_includes {
-                                fake_dns_include.push(ext_include.clone());
-                            }
-                        }
-                        if !fake_dns_include.is_empty() {
-                            settings.fake_dns_include = fake_dns_include;
+                        settings.fake_dns_exclude =
+                            ext_settings.fake_dns_exclude.clone().unwrap_or_default();
+                        settings.fake_dns_include =
+                            ext_settings.fake_dns_include.clone().unwrap_or_default();
+                        if !settings.fake_dns_exclude.is_empty()
+                            && !settings.fake_dns_include.is_empty()
+                        {
+                            return Err(anyhow::anyhow!(
+                                "[{}] fake_dns_exclude and fake_dns_include are mutually \
+                                 exclusive; specify only one",
+                                inbound.tag
+                            ));
                         }
 
                         let fd = ext_settings.fd.unwrap_or(-1);
@@ -702,24 +696,18 @@ pub fn to_internal(mut config: Config) -> Result<internal::Config> {
                     inbound.protocol = "nf".to_string();
                     if let Some(ext_settings) = ext_settings {
                         let mut settings = internal::NfInboundSettings::new();
-                        let mut fake_dns_exclude = Vec::new();
-                        if let Some(ext_excludes) = &ext_settings.fake_dns_exclude {
-                            for ext_exclude in ext_excludes {
-                                fake_dns_exclude.push(ext_exclude.clone());
-                            }
-                        }
-                        if !fake_dns_exclude.is_empty() {
-                            settings.fake_dns_exclude = fake_dns_exclude;
-                        }
-
-                        let mut fake_dns_include = Vec::new();
-                        if let Some(ext_includes) = &ext_settings.fake_dns_include {
-                            for ext_include in ext_includes {
-                                fake_dns_include.push(ext_include.clone());
-                            }
-                        }
-                        if !fake_dns_include.is_empty() {
-                            settings.fake_dns_include = fake_dns_include;
+                        settings.fake_dns_exclude =
+                            ext_settings.fake_dns_exclude.clone().unwrap_or_default();
+                        settings.fake_dns_include =
+                            ext_settings.fake_dns_include.clone().unwrap_or_default();
+                        if !settings.fake_dns_exclude.is_empty()
+                            && !settings.fake_dns_include.is_empty()
+                        {
+                            return Err(anyhow::anyhow!(
+                                "[{}] fake_dns_exclude and fake_dns_include are mutually \
+                                 exclusive; specify only one",
+                                inbound.tag
+                            ));
                         }
 
                         settings.driver_name = ext_settings.driver_name.clone();

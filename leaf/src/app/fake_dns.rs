@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
+use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 use hickory_proto::op::{
@@ -21,6 +22,32 @@ pub struct FakeDns(RwLock<FakeDnsImpl>);
 impl FakeDns {
     pub fn new(mode: FakeDnsMode, filters: Vec<String>) -> Self {
         Self(RwLock::new(FakeDnsImpl::new(mode, filters)))
+    }
+
+    /// Resolves the two-field proto representation of fake DNS configuration into a
+    /// single [`FakeDns`] instance, returning `None` when neither list is configured.
+    ///
+    /// The protobuf schema stores mode and filters as two mutually exclusive
+    /// `repeated string` fields (`fake_dns_exclude` / `fake_dns_include`). This
+    /// function is the single authoritative place that converts that representation
+    /// into the typed `(mode, filters)` pair, enforcing their mutual exclusivity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when both `exclude` and `include` are non-empty, since the
+    /// intended mode would be ambiguous.
+    pub fn from_proto_settings(
+        exclude: Vec<String>,
+        include: Vec<String>,
+    ) -> Result<Option<Arc<Self>>> {
+        match (!exclude.is_empty(), !include.is_empty()) {
+            (true, true) => Err(anyhow!(
+                "fake_dns_exclude and fake_dns_include are mutually exclusive; specify only one"
+            )),
+            (false, true) => Ok(Some(Arc::new(Self::new(FakeDnsMode::Include, include)))),
+            (true, false) => Ok(Some(Arc::new(Self::new(FakeDnsMode::Exclude, exclude)))),
+            (false, false) => Ok(None),
+        }
     }
 
     pub async fn query_domain(&self, ip: &IpAddr) -> Option<String> {
@@ -243,5 +270,54 @@ mod tests {
         let ip1 = FakeDnsImpl::ip_to_u32(&ip);
         let ip2 = 2130706433u32;
         assert_eq!(ip1, ip2);
+    }
+
+    // --- FakeDns::from_proto_settings: all four input combinations ---
+
+    /// Both lists empty → no fake-DNS configured; caller should treat DNS normally.
+    #[test]
+    fn test_from_proto_settings_both_empty_returns_none() {
+        let result = FakeDns::from_proto_settings(vec![], vec![]);
+        assert!(result.expect("should not error").is_none());
+    }
+
+    /// Only the exclude list is set → Exclude mode: all domains are fake-DNS
+    /// candidates except those in the list.
+    #[test]
+    fn test_from_proto_settings_exclude_only_returns_exclude_mode() {
+        let result =
+            FakeDns::from_proto_settings(vec!["real.example.com".to_string()], vec![]);
+        assert!(
+            result.expect("should not error").is_some(),
+            "expected Some(FakeDns) for exclude-only config"
+        );
+    }
+
+    /// Only the include list is set → Include mode: only listed domains are
+    /// fake-DNS candidates.
+    #[test]
+    fn test_from_proto_settings_include_only_returns_include_mode() {
+        let result =
+            FakeDns::from_proto_settings(vec![], vec!["fake.example.com".to_string()]);
+        assert!(
+            result.expect("should not error").is_some(),
+            "expected Some(FakeDns) for include-only config"
+        );
+    }
+
+    /// Both lists non-empty → ambiguous; must be a hard error so the misconfiguration
+    /// surfaces at parse time rather than silently picking one list.
+    #[test]
+    fn test_from_proto_settings_both_non_empty_errors() {
+        let result = FakeDns::from_proto_settings(
+            vec!["real.example.com".to_string()],
+            vec!["fake.example.com".to_string()],
+        );
+        let err = result.err().expect("expected error for conflicting lists");
+        assert!(
+            err.to_string().contains("mutually exclusive"),
+            "unexpected error message: {}",
+            err
+        );
     }
 }
