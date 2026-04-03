@@ -56,6 +56,7 @@ pub struct InboundManager {
 
 impl InboundManager {
     pub fn new(
+        rt_id: crate::RuntimeId,
         inbounds: &[config::Inbound],
         dispatcher: Arc<Dispatcher>,
         nat_manager: Arc<NatManager>,
@@ -342,6 +343,7 @@ impl InboundManager {
                 #[cfg(feature = "inbound-tun")]
                 "tun" => {
                     let listener = TunInboundListener {
+                        rt_id,
                         inbound: inbound.clone(),
                         dispatcher: dispatcher.clone(),
                         nat_manager: nat_manager.clone(),

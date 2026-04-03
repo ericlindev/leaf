@@ -1,4 +1,5 @@
 pub mod inbound;
+pub mod packet_io;
 
 #[cfg(feature = "netstack-lwip")]
 pub use netstack_lwip;

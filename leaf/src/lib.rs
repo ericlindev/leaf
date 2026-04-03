@@ -347,6 +347,16 @@ impl RuntimeManager {
 
 pub type RuntimeId = u16;
 
+#[cfg(feature = "inbound-tun")]
+struct PacketTunnelCleanupGuard(RuntimeId);
+
+#[cfg(feature = "inbound-tun")]
+impl Drop for PacketTunnelCleanupGuard {
+    fn drop(&mut self) {
+        crate::proxy::tun::packet_io::remove_runtime_packet_tunnel(self.0);
+    }
+}
+
 lazy_static! {
     pub static ref RUNTIME_MANAGER: Mutex<HashMap<RuntimeId, Arc<RuntimeManager>>> =
         Mutex::new(HashMap::new());
@@ -434,6 +444,9 @@ pub fn start(rt_id: RuntimeId, opts: StartOptions) -> Result<(), Error> {
     #[cfg(debug_assertions)]
     println!("start with options:\n{:#?}", opts);
 
+    #[cfg(feature = "inbound-tun")]
+    let _packet_tunnel_cleanup_guard = PacketTunnelCleanupGuard(rt_id);
+
     let (reload_tx, mut reload_rx) = mpsc::channel(1);
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel(1);
 
@@ -485,8 +498,8 @@ pub fn start(rt_id: RuntimeId, opts: StartOptions) -> Result<(), Error> {
     });
 
     let nat_manager = Arc::new(NatManager::new(dispatcher.clone()));
-    let inbound_manager =
-        InboundManager::new(&config.inbounds, dispatcher, nat_manager).map_err(Error::Config)?;
+    let inbound_manager = InboundManager::new(rt_id, &config.inbounds, dispatcher, nat_manager)
+        .map_err(Error::Config)?;
     let mut inbound_net_runners = inbound_manager
         .get_network_runners()
         .map_err(Error::Config)?;

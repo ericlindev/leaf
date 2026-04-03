@@ -161,6 +161,12 @@ lazy_static! {
         get_env_var_or("NETSTACK_OUTPUT_CHANNEL_SIZE", 512)
     };
 
+    /// Default maximum number of packets queued from Swift into the external
+    /// packet tunnel before backpressure is applied.
+    pub static ref PACKET_TUNNEL_INPUT_QUEUE_SIZE: usize = {
+        get_env_var_or("PACKET_TUNNEL_INPUT_QUEUE_SIZE", 256)
+    };
+
     pub static ref NETSTACK_UDP_UPLINK_CHANNEL_SIZE: usize = {
         get_env_var_or("NETSTACK_UDP_UPLINK_CHANNEL_SIZE", 256)
     };

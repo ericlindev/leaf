@@ -3,6 +3,7 @@ name = "leaf-ffi"
 version = "0.1.0"
 authors = ["eycorsican <eric.y.corsican@gmail.com>"]
 edition = "2021"
+build = "build.rs"
 
 [lib]
 name = "leaf"
@@ -34,3 +35,7 @@ leaf = { path = "../leaf", default-features = false, optional = true }
 tokio = { version = "1", features = ["rt"] }
 anyhow = "1.0"
 futures = "0.3"
+tracing = "0.1"
+
+[build-dependencies]
+cc = "1.2"

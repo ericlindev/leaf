@@ -1,3 +1,4 @@
+use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -332,13 +333,20 @@ async fn handle_inbound_datagram_smoltcp(
 }
 
 #[cfg(feature = "netstack-lwip")]
-fn new_lwip(
+fn new_lwip<T>(
     inbound: Inbound,
     dispatcher: Arc<Dispatcher>,
     nat_manager: Arc<NatManager>,
     fakedns: Option<Arc<FakeDns>>,
-    tun: tun::AsyncDevice,
-) -> Result<Runner> {
+    packet_io: T,
+) -> Result<Runner>
+where
+    T: futures::Stream<Item = io::Result<Vec<u8>>>
+        + futures::Sink<Vec<u8>, Error = io::Error>
+        + Send
+        + Unpin
+        + 'static,
+{
     let (stack, mut tcp_listener, udp_socket) = lwip::NetStack::with_buffer_size(
         *crate::option::NETSTACK_OUTPUT_CHANNEL_SIZE,
         *crate::option::NETSTACK_UDP_UPLINK_CHANNEL_SIZE,
@@ -346,8 +354,7 @@ fn new_lwip(
 
     Ok(Box::pin(async move {
         let inbound_tag = inbound.tag.clone();
-        let framed = tun.into_framed();
-        let (mut tun_sink, mut tun_stream) = framed.split();
+        let (mut tun_sink, mut tun_stream) = packet_io.split();
         let (mut stack_sink, mut stack_stream) = stack.split();
 
         let mut futs: Vec<Runner> = Vec::new();
@@ -364,7 +371,7 @@ fn new_lwip(
                         }
                     }
                     Err(e) => {
-                        error!("Net stack erorr: {}", e);
+                        error!("Net stack error: {}", e);
                         return;
                     }
                 }
@@ -418,13 +425,20 @@ fn new_lwip(
 }
 
 #[cfg(feature = "netstack-smoltcp")]
-fn new_smoltcp(
+fn new_smoltcp<T>(
     inbound: Inbound,
     dispatcher: Arc<Dispatcher>,
     nat_manager: Arc<NatManager>,
     fakedns: Option<Arc<FakeDns>>,
-    tun: tun::AsyncDevice,
-) -> Result<Runner> {
+    packet_io: T,
+) -> Result<Runner>
+where
+    T: futures::Stream<Item = io::Result<Vec<u8>>>
+        + futures::Sink<Vec<u8>, Error = io::Error>
+        + Send
+        + Unpin
+        + 'static,
+{
     let (stack, runner, udp_socket, tcp_listener) = smoltcp::StackBuilder::default()
         .enable_tcp(true)
         .enable_udp(true)
@@ -444,8 +458,7 @@ fn new_smoltcp(
 
     Ok(Box::pin(async move {
         let inbound_tag = inbound.tag.clone();
-        let framed = tun.into_framed();
-        let (mut tun_sink, mut tun_stream) = framed.split();
+        let (mut tun_sink, mut tun_stream) = packet_io.split();
         let (mut stack_sink, mut stack_stream) = stack.split();
 
         let mut futs: Vec<Runner> = Vec::new();
@@ -461,7 +474,7 @@ fn new_smoltcp(
                         }
                     }
                     Err(e) => {
-                        error!("Net stack erorr: {}", e);
+                        error!("Net stack error: {}", e);
                         return;
                     }
                 }
@@ -515,6 +528,7 @@ fn new_smoltcp(
 }
 
 pub fn new(
+    rt_id: crate::RuntimeId,
     inbound: Inbound,
     dispatcher: Arc<Dispatcher>,
     nat_manager: Arc<NatManager>,
@@ -534,6 +548,72 @@ pub fn new(
     }
 
     let settings = TunInboundSettings::parse_from_bytes(&inbound.settings)?;
+
+    // FIXME it's a bad design to have 2 lists in config while we need only one
+    let fake_dns_exclude = settings.fake_dns_exclude;
+    let fake_dns_include = settings.fake_dns_include;
+    if !fake_dns_exclude.is_empty() && !fake_dns_include.is_empty() {
+        return Err(anyhow!(
+            "fake DNS run in either include mode or exclude mode"
+        ));
+    }
+    let fakedns = if !fake_dns_include.is_empty() {
+        Some(Arc::new(FakeDns::new(
+            FakeDnsMode::Include,
+            fake_dns_include,
+        )))
+    } else if !fake_dns_exclude.is_empty() {
+        Some(Arc::new(FakeDns::new(
+            FakeDnsMode::Exclude,
+            fake_dns_exclude,
+        )))
+    } else {
+        None
+    };
+
+    if let Some(packet_tunnel) = super::packet_io::take_runtime_packet_tunnel(rt_id)
+        .map_err(|e| anyhow!("take packet tunnel failed: {}", e))?
+    {
+        if settings.fd >= 0 {
+            warn!(
+                "tun-fd is configured but ignored because external packet I/O is active for runtime {}",
+                rt_id
+            );
+        }
+        if settings.auto {
+            warn!(
+                "tun-auto is configured but ignored because external packet I/O is active for runtime {}",
+                rt_id
+            );
+        }
+        info!("start tun inbound with external packet I/O");
+        let result = match settings.tun2socks.as_str() {
+            "smoltcp" => {
+                #[cfg(feature = "netstack-smoltcp")]
+                {
+                    new_smoltcp(inbound, dispatcher, nat_manager, fakedns, packet_tunnel)
+                }
+                #[cfg(not(feature = "netstack-smoltcp"))]
+                {
+                    Err(anyhow!("netstack-smoltcp feature is not enabled"))
+                }
+            }
+            _ => {
+                #[cfg(feature = "netstack-lwip")]
+                {
+                    new_lwip(inbound, dispatcher, nat_manager, fakedns, packet_tunnel)
+                }
+                #[cfg(not(feature = "netstack-lwip"))]
+                {
+                    Err(anyhow!("netstack-lwip feature is not enabled"))
+                }
+            }
+        };
+        if result.is_err() {
+            super::packet_io::remove_runtime_packet_tunnel(rt_id);
+        }
+        return result;
+    }
 
     let mut cfg = tun::Configuration::default();
     if settings.fd >= 0 {
@@ -563,28 +643,6 @@ pub fn new(
 
         cfg.up();
     }
-
-    // FIXME it's a bad design to have 2 lists in config while we need only one
-    let fake_dns_exclude = settings.fake_dns_exclude;
-    let fake_dns_include = settings.fake_dns_include;
-    if !fake_dns_exclude.is_empty() && !fake_dns_include.is_empty() {
-        return Err(anyhow!(
-            "fake DNS run in either include mode or exclude mode"
-        ));
-    }
-    let fakedns = if !fake_dns_include.is_empty() {
-        Some(Arc::new(FakeDns::new(
-            FakeDnsMode::Include,
-            fake_dns_include,
-        )))
-    } else if !fake_dns_exclude.is_empty() {
-        Some(Arc::new(FakeDns::new(
-            FakeDnsMode::Exclude,
-            fake_dns_exclude,
-        )))
-    } else {
-        None
-    };
 
     #[cfg(target_os = "windows")]
     {
@@ -617,13 +675,13 @@ pub fn new(
     match settings.tun2socks.as_str() {
         "smoltcp" => {
             #[cfg(feature = "netstack-smoltcp")]
-            return new_smoltcp(inbound, dispatcher, nat_manager, fakedns, tun);
+            return new_smoltcp(inbound, dispatcher, nat_manager, fakedns, tun.into_framed());
             #[cfg(not(feature = "netstack-smoltcp"))]
             return Err(anyhow!("netstack-smoltcp feature is not enabled"));
         }
         _ => {
             #[cfg(feature = "netstack-lwip")]
-            return new_lwip(inbound, dispatcher, nat_manager, fakedns, tun);
+            return new_lwip(inbound, dispatcher, nat_manager, fakedns, tun.into_framed());
             #[cfg(not(feature = "netstack-lwip"))]
             return Err(anyhow!("netstack-lwip feature is not enabled"));
         }
