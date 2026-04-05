@@ -255,7 +255,18 @@ impl FakeDnsImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hickory_proto::op::Query;
+    use hickory_proto::rr::Name;
     use std::net::Ipv4Addr;
+
+    fn make_a_request(domain: &str) -> Vec<u8> {
+        let mut request = Message::new();
+        request.add_query(Query::query(
+            Name::from_ascii(domain).expect("valid domain name"),
+            RecordType::A,
+        ));
+        request.to_vec().expect("query should serialize")
+    }
 
     #[test]
     fn test_u32_to_ip() {
@@ -283,25 +294,53 @@ mod tests {
 
     /// Only the exclude list is set → Exclude mode: all domains are fake-DNS
     /// candidates except those in the list.
-    #[test]
-    fn test_from_proto_settings_exclude_only_returns_exclude_mode() {
-        let result =
-            FakeDns::from_proto_settings(vec!["real.example.com".to_string()], vec![]);
+    #[tokio::test]
+    async fn test_from_proto_settings_exclude_only_returns_exclude_mode() {
+        let result = FakeDns::from_proto_settings(vec!["real.example.com".to_string()], vec![]);
+        let fake_dns = result
+            .expect("should not error")
+            .expect("expected Some(FakeDns) for exclude-only config");
+
+        let accepted = fake_dns
+            .generate_fake_response(&make_a_request("other.example.com"))
+            .await;
+        let excluded = fake_dns
+            .generate_fake_response(&make_a_request("real.example.com"))
+            .await;
+
         assert!(
-            result.expect("should not error").is_some(),
-            "expected Some(FakeDns) for exclude-only config"
+            accepted.is_ok(),
+            "exclude-only config should fake unlisted domains"
+        );
+        assert!(
+            excluded.is_err(),
+            "exclude-only config should not fake excluded domains"
         );
     }
 
     /// Only the include list is set → Include mode: only listed domains are
     /// fake-DNS candidates.
-    #[test]
-    fn test_from_proto_settings_include_only_returns_include_mode() {
-        let result =
-            FakeDns::from_proto_settings(vec![], vec!["fake.example.com".to_string()]);
+    #[tokio::test]
+    async fn test_from_proto_settings_include_only_returns_include_mode() {
+        let result = FakeDns::from_proto_settings(vec![], vec!["fake.example.com".to_string()]);
+        let fake_dns = result
+            .expect("should not error")
+            .expect("expected Some(FakeDns) for include-only config");
+
+        let included = fake_dns
+            .generate_fake_response(&make_a_request("fake.example.com"))
+            .await;
+        let excluded = fake_dns
+            .generate_fake_response(&make_a_request("other.example.com"))
+            .await;
+
         assert!(
-            result.expect("should not error").is_some(),
-            "expected Some(FakeDns) for include-only config"
+            included.is_ok(),
+            "include-only config should fake listed domains"
+        );
+        assert!(
+            excluded.is_err(),
+            "include-only config should not fake unlisted domains"
         );
     }
 

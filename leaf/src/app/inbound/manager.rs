@@ -137,22 +137,24 @@ impl InboundManager {
                 "nf" => {
                     let settings: crate::config::NfInboundSettings =
                         protobuf::Message::parse_from_bytes(&inbound.settings)?;
+                    let crate::config::NfInboundSettings {
+                        driver_name,
+                        nfapi,
+                        fake_dns_exclude,
+                        fake_dns_include,
+                        ..
+                    } = settings;
                     use crate::app::fake_dns::{FakeDns, FakeDnsMode};
-                    let fake_dns = FakeDns::from_proto_settings(
-                        settings.fake_dns_exclude.clone(),
-                        settings.fake_dns_include.clone(),
-                    )?
-                    // NfManager always requires a FakeDns instance; an unconfigured
-                    // fake DNS defaults to exclude-mode with an empty filter list,
-                    // which accepts all domains (no domain is excluded).
-                    .unwrap_or_else(|| {
-                        Arc::new(FakeDns::new(FakeDnsMode::Exclude, Vec::new()))
-                    });
-                    let manager = Arc::new(nf::inbound::NfManager::new(
-                        settings.driver_name.clone(),
-                        settings.nfapi.clone(),
-                        fake_dns,
-                    )?);
+                    let fake_dns =
+                        FakeDns::from_proto_settings(fake_dns_exclude, fake_dns_include)?
+                            // NfManager always requires a FakeDns instance; an unconfigured
+                            // fake DNS defaults to exclude-mode with an empty filter list,
+                            // which accepts all domains (no domain is excluded).
+                            .unwrap_or_else(|| {
+                                Arc::new(FakeDns::new(FakeDnsMode::Exclude, Vec::new()))
+                            });
+                    let manager =
+                        Arc::new(nf::inbound::NfManager::new(driver_name, nfapi, fake_dns)?);
                     let stream = Arc::new(nf::inbound::StreamHandler {
                         manager: manager.clone(),
                     });

@@ -399,6 +399,12 @@ impl StatManager {
                 logged,
             },
         );
+        // Intentional direction flip: for an inbound stream, data read from the
+        // socket (device → tunnel) is traffic being *sent* in the network sense,
+        // and data written to the socket (tunnel → device) is traffic *received*
+        // from the network. Swapping the Arcs here makes Counter::bytes_sent() and
+        // Counter::bytes_recvd() reflect network-direction semantics rather than
+        // raw stream I/O direction.
         Box::new(Stream {
             inner: stream,
             bytes_recvd: bytes_sent,

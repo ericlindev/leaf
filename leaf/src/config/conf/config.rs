@@ -1986,8 +1986,7 @@ nf = WinDivert.dll
 always-real-ip = real.example.com
 always-fake-ip = fake.example.com
 "#;
-        let lines: Vec<io::Result<String>> =
-            conf.lines().map(|s| Ok(s.to_string())).collect();
+        let lines: Vec<io::Result<String>> = conf.lines().map(|s| Ok(s.to_string())).collect();
         let config = from_lines(lines).unwrap();
         let err = to_internal(&config)
             .expect_err("config with both always-real-ip and always-fake-ip must fail");

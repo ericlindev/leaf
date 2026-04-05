@@ -23,14 +23,23 @@ pub async fn tcp(
     let mut stream = handler.stream()?.handle(&sess, None, stream).await?;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     stream.write_all(b"PING").await?;
-    let mut buf = Vec::with_capacity(4);
-    let n = stream.read_buf(&mut buf).await?;
-    if n == 0 {
-        Err(anyhow!(
-            "EOF during TCP health check for [{}]",
-            handler.tag()
-        ))
-    } else if buf == b"PONG" {
+    // Read exactly 4 bytes. A single read_buf call is not sufficient because TCP
+    // may deliver the response in fragments; loop until the full PONG is received
+    // or the connection closes early.
+    let mut buf = [0u8; 4];
+    let mut filled = 0usize;
+    while filled < 4 {
+        let n = stream.read(&mut buf[filled..]).await?;
+        if n == 0 {
+            return Err(anyhow!(
+                "EOF during TCP health check for [{}] after {} byte(s)",
+                handler.tag(),
+                filled
+            ));
+        }
+        filled += n;
+    }
+    if &buf == b"PONG" {
         Ok(Instant::now().duration_since(start))
     } else {
         Err(anyhow!(

@@ -703,14 +703,19 @@ pub unsafe extern "C" fn leaf_health_check(
     })
 }
 
-/// Gets the last active time for an outbound.
+/// Gets the last peer-data timestamp for an outbound.
 ///
-/// This returns the timestamp of the last successful connection through the outbound.
+/// Scans currently-active sessions for the outbound and returns the most recent
+/// timestamp at which inbound data was received on any of them. This is NOT a
+/// historical value: completed sessions are not included. If no sessions for the
+/// outbound are currently open, ERR_NO_DATA is returned regardless of how recently
+/// traffic flowed through sessions that have since closed.
 ///
 /// @param rt_id The ID of the leaf instance.
 /// @param outbound_tag The tag of the outbound.
-/// @param timestamp_s Pointer to store the timestamp in seconds since epoch.
-/// @return Returns ERR_OK on success, ERR_NO_DATA if no active time found, error code otherwise.
+/// @param timestamp_s Pointer to store the timestamp in seconds since Unix epoch.
+/// @return Returns ERR_OK on success, ERR_NO_DATA if no active sessions exist for
+///         the outbound, error code otherwise.
 #[no_mangle]
 pub unsafe extern "C" fn leaf_get_last_active(
     rt_id: u16,
@@ -751,15 +756,18 @@ pub unsafe extern "C" fn leaf_get_last_active(
     })
 }
 
-/// Gets seconds since last active time for an outbound.
+/// Gets the elapsed seconds since the last peer-data receipt for an outbound.
 ///
-/// This returns the number of seconds elapsed since the last successful
-/// connection through the specified outbound.
+/// Equivalent to (now - leaf_get_last_active), but computed atomically in Rust.
+/// Like leaf_get_last_active, this only considers currently-active sessions;
+/// sessions that have already closed are not reflected. ERR_NO_DATA is returned
+/// when no sessions for the outbound are currently open.
 ///
 /// @param rt_id The ID of the leaf instance.
 /// @param outbound_tag The tag of the outbound.
-/// @param since_s Pointer to store the seconds since last active.
-/// @return Returns ERR_OK on success, ERR_NO_DATA if no active time found, error code otherwise.
+/// @param since_s Pointer to store the elapsed seconds since last peer data receipt.
+/// @return Returns ERR_OK on success, ERR_NO_DATA if no active sessions exist for
+///         the outbound, error code otherwise.
 #[no_mangle]
 pub unsafe extern "C" fn leaf_get_since_last_active(
     rt_id: u16,

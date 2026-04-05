@@ -549,11 +549,9 @@ pub fn new(
 
     let settings = TunInboundSettings::parse_from_bytes(&inbound.settings)?;
 
-    let fakedns = FakeDns::from_proto_settings(
-        settings.fake_dns_exclude,
-        settings.fake_dns_include,
-    )
-    .map_err(|e| anyhow!("invalid fake DNS configuration: {}", e))?;
+    let fakedns =
+        FakeDns::from_proto_settings(settings.fake_dns_exclude, settings.fake_dns_include)
+            .map_err(|e| anyhow!("invalid fake DNS configuration: {}", e))?;
 
     // Validate feature availability before consuming the packet tunnel transport.
     if super::packet_io::has_runtime_packet_tunnel(rt_id) {
