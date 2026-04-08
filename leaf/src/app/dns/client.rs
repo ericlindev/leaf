@@ -126,13 +126,18 @@ impl DnsClient {
             return Ok(SocketAddr::new(ip, 443));
         }
         let domain = domain.to_owned();
-        let addr = tokio::task::spawn_blocking(move || {
-            (domain.as_str(), 443)
-                .to_socket_addrs()
-                .ok()
-                .and_then(|mut addrs| addrs.next())
-        })
+        let bootstrap_timeout = Duration::from_secs(*option::DNS_SYSTEM_TIMEOUT);
+        let addr = timeout(
+            bootstrap_timeout,
+            tokio::task::spawn_blocking(move || {
+                (domain.as_str(), 443)
+                    .to_socket_addrs()
+                    .ok()
+                    .and_then(|mut addrs| addrs.next())
+            }),
+        )
         .await
+        .map_err(|_| anyhow!("doh bootstrap timed out after {}s", bootstrap_timeout.as_secs()))?
         .map_err(|e| anyhow!("spawn blocking failed: {}", e))?
         .ok_or_else(|| anyhow!("bootstrap failed: no resolved address"))?;
         Ok(addr)
@@ -525,21 +530,46 @@ impl DnsClient {
         self.dispatcher.replace(dispatcher);
     }
 
-    pub fn reload(&mut self, dns: &protobuf::MessageField<crate::config::Dns>) -> Result<()> {
-        let dns = if let Some(dns) = dns.as_ref() {
-            dns
-        } else {
-            return Err(anyhow!("empty dns config"));
-        };
+    /// Builds new servers and hosts from config without touching `self`.
+    /// Call this before acquiring any write lock, then call `apply_new_state` under the lock.
+    pub fn build_new_state(
+        dns: &protobuf::MessageField<crate::config::Dns>,
+    ) -> Result<DnsClientState> {
+        let dns = dns.as_ref().ok_or_else(|| anyhow!("empty dns config"))?;
         let servers = Self::load_servers(dns)?;
         let hosts = Self::load_hosts(dns);
-        self.servers = servers;
-        self.hosts = hosts;
+        Ok(DnsClientState { servers, hosts })
+    }
+
+    /// Swaps in pre-built servers/hosts. Holds `&mut self` for field assignments only (~μs).
+    /// Selector stats are preserved for servers that still exist in the new config;
+    /// stats entries for removed servers are dropped. If the primary server was
+    /// removed, it is cleared so the selector picks a new best on the next query.
+    pub fn apply_new_state(&mut self, state: DnsClientState) {
+        // Build the set of server keys that will exist after this reload.
+        let new_server_keys: std::collections::HashSet<String> =
+            state.servers.iter().map(|s| s.to_string()).collect();
+
+        self.servers = state.servers;
+        self.hosts = state.hosts;
+
         if let Ok(mut selector) = self.selector_state.lock() {
-            selector.primary_server = None;
-            selector.last_reselect_at = None;
-            selector.stats.clear();
+            // Drop stats for servers that no longer exist; keep stats for
+            // servers that carried over so we don't lose learned quality data.
+            selector.stats.retain(|k, _| new_server_keys.contains(k));
+
+            // Only reset primary/reselect if the primary was removed.
+            if let Some(ref primary) = selector.primary_server {
+                if !new_server_keys.contains(primary) {
+                    selector.primary_server = None;
+                    selector.last_reselect_at = None;
+                }
+            }
         }
+    }
+
+    pub fn reload(&mut self, dns: &protobuf::MessageField<crate::config::Dns>) -> Result<()> {
+        self.apply_new_state(Self::build_new_state(dns)?);
         Ok(())
     }
 
@@ -924,11 +954,16 @@ impl DnsClient {
                 use std::net::ToSocketAddrs;
                 let addr = format!("{}:0", host);
                 let start = std::time::Instant::now();
-                let ips = tokio::task::spawn_blocking(move || {
-                    addr.to_socket_addrs()
-                        .map(|iter| iter.map(|x| x.ip()).collect::<Vec<_>>())
-                })
+                let system_timeout = Duration::from_secs(*option::DNS_SYSTEM_TIMEOUT);
+                let ips = timeout(
+                    system_timeout,
+                    tokio::task::spawn_blocking(move || {
+                        addr.to_socket_addrs()
+                            .map(|iter| iter.map(|x| x.ip()).collect::<Vec<_>>())
+                    }),
+                )
                 .await
+                .map_err(|_| anyhow!("system resolver timed out after {}s", system_timeout.as_secs()))?
                 .map_err(|e| anyhow!("spawn blocking failed: {}", e))?
                 .map_err(|e| anyhow!("system resolver failed: {}", e))?;
 
@@ -1061,14 +1096,14 @@ impl DnsClient {
         ty: RecordType,
     ) -> Result<(CacheEntry, Duration)> {
         let start = tokio::time::Instant::now();
-        let res = match timeout(
+        let (res, timed_out) = match timeout(
             Duration::from_secs(*option::DNS_TIMEOUT),
             self.resolve_with_server(is_direct, request, host, resolver),
         )
         .await
         {
-            Ok(res) => res,
-            Err(_) => Err(anyhow!("query {} {} timeout", host, ty)),
+            Ok(res) => (res, false),
+            Err(_) => (Err(anyhow!("query {} {} timeout", host, ty)), true),
         };
         match res {
             Ok(entry) => {
@@ -1078,8 +1113,7 @@ impl DnsClient {
                 Ok((entry, elapsed))
             }
             Err(e) => {
-                let is_timeout = e.to_string().contains("timeout");
-                self.mark_server_failure(resolver, is_timeout);
+                self.mark_server_failure(resolver, timed_out);
                 debug!(
                     "query {} {} failed with server {}: {}",
                     host, ty, resolver, e
@@ -1098,14 +1132,14 @@ impl DnsClient {
         ty: RecordType,
     ) -> Result<(EchCacheEntry, Duration)> {
         let start = tokio::time::Instant::now();
-        let res = match timeout(
+        let (res, timed_out) = match timeout(
             Duration::from_secs(*option::DNS_TIMEOUT),
             self.resolve_ech_with_server(is_direct, request, host, resolver, ty),
         )
         .await
         {
-            Ok(res) => res,
-            Err(_) => Err(anyhow!("query {} {} timeout", host, ty)),
+            Ok(res) => (res, false),
+            Err(_) => (Err(anyhow!("query {} {} timeout", host, ty)), true),
         };
         match res {
             Ok(entry) => {
@@ -1114,8 +1148,7 @@ impl DnsClient {
                 Ok((entry, elapsed))
             }
             Err(e) => {
-                let is_timeout = e.to_string().contains("timeout");
-                self.mark_server_failure(resolver, is_timeout);
+                self.mark_server_failure(resolver, timed_out);
                 debug!(
                     "query ech {} {} failed with server {}: {}",
                     host, ty, resolver, e
@@ -1203,6 +1236,7 @@ impl DnsClient {
         host: &str,
         ty: RecordType,
     ) -> Result<CacheEntry> {
+        let query_start = tokio::time::Instant::now();
         let msg = Self::new_query(name.clone(), ty);
         let msg_buf = match msg.to_vec() {
             Ok(b) => b,
@@ -1212,24 +1246,63 @@ impl DnsClient {
         let is_direct_outbound = self.is_direct_outbound(host).await?;
         let servers = self.collect_servers(is_direct_outbound);
         if servers.is_empty() {
+            warn!(host, ?ty, "dns: no servers available for query");
             return Err(anyhow!("no dns servers available for query"));
         }
         if servers.len() == 1 {
-            return self
+            debug!(
+                host,
+                ?ty,
+                server = %servers[0],
+                "dns: single server query"
+            );
+            let result = self
                 .query_task(is_direct, msg_buf, host, servers[0], ty)
                 .await
                 .map(|(entry, _)| entry);
+            let elapsed_ms = query_start.elapsed().as_millis() as u64;
+            match &result {
+                Ok(entry) => debug!(host, ?ty, elapsed_ms, ips = ?entry.ips, "dns: resolved"),
+                Err(e) => warn!(host, ?ty, elapsed_ms, error = %e, "dns: resolution failed"),
+            }
+            return result;
         }
         let preferred_idx = self.select_preferred_server_index(&servers);
         let preferred = servers[preferred_idx];
+        debug!(
+            host,
+            ?ty,
+            preferred_server = %preferred,
+            total_servers = servers.len(),
+            "dns: starting resolution"
+        );
         let mut errors = Vec::new();
 
         match self
             .query_task(is_direct, msg_buf.clone(), host, preferred, ty)
             .await
         {
-            Ok((entry, _)) => return Ok(entry),
-            Err(err) => errors.push(format!("{}: {}", preferred, err)),
+            Ok((entry, elapsed)) => {
+                debug!(
+                    host,
+                    ?ty,
+                    server = %preferred,
+                    elapsed_ms = elapsed.as_millis() as u64,
+                    ips = ?entry.ips,
+                    "dns: resolved via preferred server"
+                );
+                return Ok(entry);
+            }
+            Err(err) => {
+                debug!(
+                    host,
+                    ?ty,
+                    server = %preferred,
+                    error = %err,
+                    "dns: preferred server failed, trying fallbacks"
+                );
+                errors.push(format!("{}: {}", preferred, err));
+            }
         }
 
         let fallback_indices = self.fallback_server_indices(&servers, preferred_idx);
@@ -1247,7 +1320,15 @@ impl DnsClient {
                     .query_task(is_direct, msg_buf.clone(), host, servers[idx], ty)
                     .await
                 {
-                    Ok((entry, _)) => {
+                    Ok((entry, elapsed)) => {
+                        debug!(
+                            host,
+                            ?ty,
+                            server = %servers[idx],
+                            elapsed_ms = elapsed.as_millis() as u64,
+                            ips = ?entry.ips,
+                            "dns: resolved via fallback server"
+                        );
                         self.switch_primary_server(servers[idx]);
                         return Ok(entry);
                     }
@@ -1261,12 +1342,20 @@ impl DnsClient {
                     let t = async move {
                         self.query_task(is_direct, request, host, resolver, ty)
                             .await
-                            .map(|(entry, _)| (*idx, entry))
+                            .map(|(entry, elapsed)| (*idx, entry, elapsed))
                     };
                     tasks.push(Box::pin(t));
                 }
                 match select_ok(tasks.into_iter()).await {
-                    Ok(((idx, entry), _)) => {
+                    Ok(((idx, entry, elapsed), _)) => {
+                        debug!(
+                            host,
+                            ?ty,
+                            server = %servers[idx],
+                            elapsed_ms = elapsed.as_millis() as u64,
+                            ips = ?entry.ips,
+                            "dns: resolved via concurrent fallback"
+                        );
                         self.switch_primary_server(servers[idx]);
                         return Ok(entry);
                     }
@@ -1276,6 +1365,14 @@ impl DnsClient {
             cursor = batch_end;
         }
 
+        let total_elapsed_ms = query_start.elapsed().as_millis() as u64;
+        warn!(
+            host,
+            ?ty,
+            total_elapsed_ms,
+            errors = %errors.join("; "),
+            "dns: all servers failed"
+        );
         Err(anyhow!("all dns queries failed: {}", errors.join("; ")))
     }
 
@@ -1565,8 +1662,10 @@ impl DnsClient {
         }
 
         if let Ok(ips) = self.get_cached(host).await {
+            trace!(host, ips = ?ips, "dns: cache hit");
             return Ok(ips);
         }
+        trace!(host, "dns: cache miss, querying");
 
         // Making cache lookup a priority rather than static hosts lookup
         // and insert the static IPs to the cache because there's a chance

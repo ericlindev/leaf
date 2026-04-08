@@ -313,6 +313,12 @@ lazy_static! {
         get_env_var_or("DNS_TIMEOUT", 4)
     };
 
+    /// Timeout for the system resolver and DoH bootstrap (spawn_blocking calls).
+    /// Without this, a stalled system resolver could hang indefinitely.
+    pub static ref DNS_SYSTEM_TIMEOUT: u64 = {
+        get_env_var_or("DNS_SYSTEM_TIMEOUT", 4)
+    };
+
     pub static ref DNS_SERVER_RESELECT_INTERVAL_SECS: u64 = {
         get_env_var_or("DNS_SERVER_RESELECT_INTERVAL_SECS", 30)
     };

@@ -468,6 +468,13 @@ impl Condition for ConditionOr {
     }
 }
 
+/// Opaque container for pre-built Router internals.
+/// Produced by `Router::build_new_state`, consumed by `Router::apply_new_state`.
+pub struct RouterState {
+    rules: Vec<Rule>,
+    domain_resolve: bool,
+}
+
 pub struct Router {
     rules: Vec<Rule>,
     domain_resolve: bool,
@@ -555,12 +562,28 @@ impl Router {
         }
     }
 
-    pub fn reload(&mut self, router: &mut protobuf::MessageField<config::Router>) -> Result<()> {
-        self.rules.clear();
+    /// Builds the new rules and domain_resolve flag from config without touching `self`.
+    /// Call this before acquiring any write lock, then call `apply_new_state` under the lock.
+    pub fn build_new_state(
+        router: &mut protobuf::MessageField<config::Router>,
+    ) -> RouterState {
+        let mut rules: Vec<Rule> = Vec::new();
+        let mut domain_resolve = false;
         if let Some(router) = router.as_mut() {
-            Self::load_rules(&mut self.rules, &mut router.rules);
-            self.domain_resolve = router.domain_resolve;
+            Self::load_rules(&mut rules, &mut router.rules);
+            domain_resolve = router.domain_resolve;
         }
+        RouterState { rules, domain_resolve }
+    }
+
+    /// Swaps in pre-built state. Holds `&mut self` for field assignments only (~μs).
+    pub fn apply_new_state(&mut self, state: RouterState) {
+        self.rules = state.rules;
+        self.domain_resolve = state.domain_resolve;
+    }
+
+    pub fn reload(&mut self, router: &mut protobuf::MessageField<config::Router>) -> Result<()> {
+        self.apply_new_state(Self::build_new_state(router));
         Ok(())
     }
 
@@ -707,5 +730,61 @@ mod tests {
 
         sess.destination = SocksAddr::from(("10.0.0.2".parse::<IpAddr>().unwrap(), 80));
         assert!(!m.apply(&sess));
+    }
+
+    #[test]
+    fn build_new_state_with_empty_config_yields_no_rules() {
+        let mut router_cfg = protobuf::MessageField::none();
+        let state = Router::build_new_state(&mut router_cfg);
+        assert!(state.rules.is_empty());
+        assert!(!state.domain_resolve);
+    }
+
+    #[test]
+    fn build_new_state_captures_domain_resolve_flag() {
+        let mut cfg = config::Router::new();
+        cfg.domain_resolve = true;
+        let mut router_cfg = protobuf::MessageField::some(cfg);
+        let state = Router::build_new_state(&mut router_cfg);
+        assert!(state.domain_resolve);
+    }
+
+    #[test]
+    fn apply_new_state_replaces_rules_and_flag() {
+        use crate::DnsClient;
+        let dns_client: crate::app::SyncDnsClient =
+            Arc::new(tokio::sync::RwLock::new(
+                DnsClient::new(
+                    &protobuf::MessageField::some({
+                        let mut dns = crate::config::Dns::new();
+                        dns.servers = vec!["1.1.1.1".to_string()];
+                        dns
+                    }),
+                )
+                .unwrap(),
+            ));
+        let mut router = Router::new(
+            &mut protobuf::MessageField::none(),
+            dns_client,
+        );
+        assert!(!router.domain_resolve);
+        assert!(router.rules.is_empty());
+
+        // Build state with domain_resolve = true and a domain rule
+        let mut cfg = config::Router::new();
+        cfg.domain_resolve = true;
+        let mut rule = config::router::Rule::new();
+        rule.target_tag = "proxy".to_string();
+        let mut domain = config::router::rule::Domain::new();
+        domain.type_ = config::router::rule::domain::Type::PLAIN.into();
+        domain.value = "example".to_string();
+        rule.domains.push(domain);
+        cfg.rules.push(rule);
+        let mut router_cfg = protobuf::MessageField::some(cfg);
+        let state = Router::build_new_state(&mut router_cfg);
+        router.apply_new_state(state);
+
+        assert!(router.domain_resolve);
+        assert_eq!(router.rules.len(), 1);
     }
 }

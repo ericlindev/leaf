@@ -11,14 +11,14 @@ pub struct EchCacheEntry {
 }
 
 #[derive(Clone, Debug)]
-struct DohResolver {
+pub(crate) struct DohResolver {
     domain: String,
     bootstrap_ip: Option<IpAddr>,
     is_direct: bool,
 }
 
 #[derive(Clone, Debug)]
-enum Resolver {
+pub(crate) enum Resolver {
     Server(SocketAddr, bool),
     DoH(DohResolver),
     System(bool),
@@ -203,6 +203,13 @@ impl ServerSelectorState {
         self.primary_server = Some(server.to_owned());
         self.last_reselect_at = Some(Instant::now());
     }
+}
+
+/// Opaque container for pre-built DnsClient internals.
+/// Produced by `DnsClient::build_new_state`, consumed by `DnsClient::apply_new_state`.
+pub struct DnsClientState {
+    pub(crate) servers: Vec<Resolver>,
+    pub(crate) hosts: HashMap<String, Vec<IpAddr>>,
 }
 
 pub struct DnsClient {

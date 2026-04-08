@@ -1,5 +1,6 @@
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::time::Duration;
 
@@ -203,5 +204,127 @@ mod tests {
             selector.mark_success(&key, slow_elapsed);
         }
         assert!(selector.is_degraded(&key));
+    }
+
+    #[test]
+    fn apply_new_state_preserves_stats_for_retained_servers() {
+        let mut client = new_client(vec!["1.1.1.1", "8.8.8.8"]);
+        // Accumulate stats on 1.1.1.1
+        let key = "1.1.1.1:53".to_string();
+        {
+            let mut selector = client.selector_state.lock().unwrap();
+            selector.mark_success(&key, Duration::from_millis(50));
+            selector.mark_success(&key, Duration::from_millis(60));
+            assert!(selector.stats.contains_key(&key));
+        }
+        // Reload with same servers
+        let state = DnsClient::build_new_state(
+            &protobuf::MessageField::some({
+                let mut dns = crate::config::Dns::new();
+                dns.servers = vec!["1.1.1.1".to_string(), "8.8.8.8".to_string()];
+                dns
+            }),
+        )
+        .unwrap();
+        client.apply_new_state(state);
+        // Stats for retained server must survive
+        let selector = client.selector_state.lock().unwrap();
+        assert!(selector.stats.contains_key(&key));
+        assert!(selector.stats[&key].successes >= 2);
+    }
+
+    #[test]
+    fn apply_new_state_drops_stats_for_removed_servers() {
+        let mut client = new_client(vec!["1.1.1.1", "8.8.8.8"]);
+        let key_removed = "8.8.8.8:53".to_string();
+        {
+            let mut selector = client.selector_state.lock().unwrap();
+            selector.mark_success(&key_removed, Duration::from_millis(100));
+        }
+        // Reload with only 1.1.1.1 — 8.8.8.8 is removed
+        let state = DnsClient::build_new_state(
+            &protobuf::MessageField::some({
+                let mut dns = crate::config::Dns::new();
+                dns.servers = vec!["1.1.1.1".to_string()];
+                dns
+            }),
+        )
+        .unwrap();
+        client.apply_new_state(state);
+        let selector = client.selector_state.lock().unwrap();
+        assert!(!selector.stats.contains_key(&key_removed));
+    }
+
+    #[test]
+    fn apply_new_state_clears_primary_when_removed() {
+        let mut client = new_client(vec!["1.1.1.1", "8.8.8.8"]);
+        let key = "1.1.1.1:53".to_string();
+        {
+            let mut selector = client.selector_state.lock().unwrap();
+            selector.set_primary(&key);
+            assert_eq!(selector.primary_server.as_deref(), Some(key.as_str()));
+        }
+        // Reload without 1.1.1.1
+        let state = DnsClient::build_new_state(
+            &protobuf::MessageField::some({
+                let mut dns = crate::config::Dns::new();
+                dns.servers = vec!["8.8.8.8".to_string()];
+                dns
+            }),
+        )
+        .unwrap();
+        client.apply_new_state(state);
+        let selector = client.selector_state.lock().unwrap();
+        assert!(selector.primary_server.is_none());
+    }
+
+    #[test]
+    fn apply_new_state_keeps_primary_when_retained() {
+        let mut client = new_client(vec!["1.1.1.1", "8.8.8.8"]);
+        let key = "1.1.1.1:53".to_string();
+        {
+            let mut selector = client.selector_state.lock().unwrap();
+            selector.set_primary(&key);
+        }
+        // Reload with same servers
+        let state = DnsClient::build_new_state(
+            &protobuf::MessageField::some({
+                let mut dns = crate::config::Dns::new();
+                dns.servers = vec!["1.1.1.1".to_string(), "8.8.8.8".to_string()];
+                dns
+            }),
+        )
+        .unwrap();
+        client.apply_new_state(state);
+        let selector = client.selector_state.lock().unwrap();
+        assert_eq!(selector.primary_server.as_deref(), Some(key.as_str()));
+    }
+
+    #[test]
+    fn build_new_state_rejects_empty_dns_config() {
+        let result = DnsClient::build_new_state(&protobuf::MessageField::none());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn apply_new_state_updates_servers_and_hosts() {
+        let mut client = new_client(vec!["1.1.1.1"]);
+        assert_eq!(client.servers.len(), 1);
+        // Reload with 2 servers and a host override
+        let mut dns = crate::config::Dns::new();
+        dns.servers = vec!["1.1.1.1".to_string(), "9.9.9.9".to_string()];
+        let mut hosts = HashMap::new();
+        hosts.insert(
+            "example.com".to_string(),
+            crate::config::dns::Ips {
+                values: vec!["10.0.0.1".to_string()],
+                ..Default::default()
+            },
+        );
+        dns.hosts = hosts;
+        let state = DnsClient::build_new_state(&protobuf::MessageField::some(dns)).unwrap();
+        client.apply_new_state(state);
+        assert_eq!(client.servers.len(), 2);
+        assert!(client.hosts.contains_key("example.com"));
     }
 }

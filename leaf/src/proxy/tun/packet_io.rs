@@ -475,6 +475,18 @@ pub fn has_runtime_packet_tunnel(rt_id: RuntimeId) -> bool {
     PACKET_TUNNELS.lock().unwrap().contains_key(&rt_id)
 }
 
+/// Returns true if the tun inbound has claimed the packet tunnel transport for
+/// this runtime, meaning it is ready to process packets. This is stronger than
+/// `has_runtime_packet_tunnel` (initialized) and `is_running` (registered).
+pub fn is_packet_tunnel_ready(rt_id: RuntimeId) -> bool {
+    PACKET_TUNNELS
+        .lock()
+        .unwrap()
+        .get(&rt_id)
+        .map(|h| h.connected.load(Ordering::Acquire))
+        .unwrap_or(false)
+}
+
 pub fn take_runtime_packet_tunnel(rt_id: RuntimeId) -> io::Result<Option<PacketTunnelTransport>> {
     let handle = PACKET_TUNNELS.lock().unwrap().get(&rt_id).cloned();
     match handle {
@@ -514,6 +526,25 @@ pub fn write_runtime_packet(rt_id: RuntimeId, packet: &[u8]) -> io::Result<()> {
 
 pub fn read_runtime_packet(rt_id: RuntimeId, buffer: &mut [u8]) -> io::Result<RuntimePacketRead> {
     get_handle(rt_id)?.read_output_packet(buffer)
+}
+
+/// Returns true if the output queue has at least one packet ready to read.
+/// This is a non-blocking, level-triggered check that callers can use to detect
+/// packets without relying solely on the edge-triggered output callback.
+pub fn has_runtime_output_packet(rt_id: RuntimeId) -> io::Result<bool> {
+    Ok(get_handle(rt_id)?.has_output_ready())
+}
+
+/// Returns the approximate number of bytes currently queued in the output
+/// (Leaf → Swift) direction. Useful for monitoring backpressure.
+pub fn output_queued_bytes(rt_id: RuntimeId) -> io::Result<usize> {
+    Ok(get_handle(rt_id)?.output_queued_bytes.load(Ordering::Relaxed))
+}
+
+/// Returns the approximate number of bytes currently queued in the input
+/// (Swift → Leaf) direction. Useful for monitoring backpressure.
+pub fn input_queued_bytes(rt_id: RuntimeId) -> io::Result<usize> {
+    Ok(get_handle(rt_id)?.input_queued_bytes.load(Ordering::Relaxed))
 }
 
 #[cfg(test)]

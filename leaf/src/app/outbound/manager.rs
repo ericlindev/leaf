@@ -73,6 +73,19 @@ pub struct OutboundManager {
     abort_handles: Vec<AbortHandle>,
 }
 
+/// Fully-built outbound state ready to be swapped into a live `OutboundManager`.
+/// Build with `OutboundManager::build_new_state` (no locks held), then apply
+/// with `OutboundManager::apply_new_state` (brief write lock only).
+pub struct NewOutboundState {
+    pub handlers: HashMap<String, AnyOutboundHandler>,
+    #[cfg(feature = "plugin")]
+    pub external_handlers: super::plugin::ExternalHandlers,
+    #[cfg(feature = "outbound-select")]
+    pub selectors: super::Selectors,
+    pub default_handler: Option<String>,
+    pub abort_handles: Vec<AbortHandle>,
+}
+
 struct HandlerCacheEntry<'a> {
     tag: &'a str,
     handler: AnyOutboundHandler,
@@ -793,29 +806,21 @@ impl OutboundManager {
     }
 
     // TODO make this non-async?
-    pub async fn reload(
-        &mut self,
+    /// Builds all handler and selector state from config without touching `self`.
+    /// Call this before acquiring any write lock, then call `apply_new_state` under the lock.
+    /// `saved_selections` is the previously-selected outbound per selector (pass `None` on
+    /// first start, pass the result of `read_selector_states` on reload).
+    #[allow(unused_variables)]
+    pub async fn build_new_state(
         outbounds: &[Outbound],
         dns_client: SyncDnsClient,
-    ) -> Result<()> {
-        // Save outound select states.
-        #[cfg(feature = "outbound-select")]
-        let selected_outbounds: HashMap<String, String> = {
-            let mut m = HashMap::new();
-            for (k, v) in self.selectors.iter() {
-                m.insert(k.to_owned(), v.read().await.get_selected_tag());
-            }
-            m
-        };
-
-        // Load new outbounds.
+        saved_selections: Option<HashMap<String, String>>,
+    ) -> Result<NewOutboundState> {
         let mut handlers: HashMap<String, AnyOutboundHandler> = HashMap::new();
-
         #[cfg(feature = "plugin")]
         let mut external_handlers = super::plugin::ExternalHandlers::new();
         let mut default_handler: Option<String> = None;
         let mut abort_handles: Vec<AbortHandle> = Vec::new();
-
         #[cfg(feature = "outbound-select")]
         let mut selectors: super::Selectors = HashMap::new();
 
@@ -839,10 +844,10 @@ impl OutboundManager {
             )?;
         }
 
-        // Restore outbound select states.
+        // Restore saved selector states if provided.
         #[cfg(feature = "outbound-select")]
-        {
-            for (k, v) in selected_outbounds.iter() {
+        if let Some(saved) = saved_selections {
+            for (k, v) in saved.iter() {
                 for (k2, v2) in selectors.iter_mut() {
                     if k == k2 {
                         let _ = v2.write().await.set_selected(v);
@@ -851,24 +856,62 @@ impl OutboundManager {
             }
         }
 
-        // Abort spawned tasks inside handlers.
+        Ok(NewOutboundState {
+            handlers,
+            #[cfg(feature = "plugin")]
+            external_handlers,
+            #[cfg(feature = "outbound-select")]
+            selectors,
+            default_handler,
+            abort_handles,
+        })
+    }
+
+    /// Reads the currently-selected outbound tag per selector.
+    /// Call this before any lock is held, pass result to `build_new_state`.
+    #[cfg(feature = "outbound-select")]
+    pub async fn read_selector_states(&self) -> HashMap<String, String> {
+        let mut m = HashMap::new();
+        for (k, v) in self.selectors.iter() {
+            m.insert(k.to_owned(), v.read().await.get_selected_tag());
+        }
+        m
+    }
+
+    /// Swaps in pre-built state. Holds `&mut self` for field assignments and
+    /// aborting old handles only (~μs). Does NOT rebuild handlers.
+    pub fn apply_new_state(&mut self, new_state: NewOutboundState) {
+        // Abort spawned tasks from the old handlers before replacing them.
         for abort_handle in self.abort_handles.iter() {
             abort_handle.abort();
         }
-
-        self.handlers = handlers;
-
+        self.handlers = new_state.handlers;
         #[cfg(feature = "plugin")]
         {
-            self.external_handlers = external_handlers;
+            self.external_handlers = new_state.external_handlers;
         }
         #[cfg(feature = "outbound-select")]
         {
-            self.selectors = Arc::new(selectors);
+            self.selectors = Arc::new(new_state.selectors);
         }
+        self.default_handler = new_state.default_handler;
+        self.abort_handles = new_state.abort_handles;
+    }
 
-        self.default_handler = default_handler;
-        self.abort_handles = abort_handles;
+    pub async fn reload(
+        &mut self,
+        outbounds: &[Outbound],
+        dns_client: SyncDnsClient,
+    ) -> Result<()> {
+        // Save selector states before building new state.
+        #[cfg(feature = "outbound-select")]
+        let saved_selections = Some(self.read_selector_states().await);
+        #[cfg(not(feature = "outbound-select"))]
+        let saved_selections: Option<HashMap<String, String>> = None;
+
+        let new_state =
+            Self::build_new_state(outbounds, dns_client, saved_selections).await?;
+        self.apply_new_state(new_state);
         Ok(())
     }
 

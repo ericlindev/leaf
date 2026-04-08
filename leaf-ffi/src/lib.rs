@@ -270,6 +270,57 @@ pub extern "C" fn leaf_is_running(rt_id: u16) -> bool {
     leaf::is_running(rt_id)
 }
 
+/// Returns true if the tun inbound has claimed the packet tunnel transport,
+/// meaning the runtime is ready to process packets.
+///
+/// This is a stronger readiness signal than `leaf_is_running`, which only
+/// indicates that the runtime is registered. Use this to gate the first call
+/// to `leaf_packet_tunnel_write` after startup.
+///
+/// @param rt_id The ID of the leaf instance to query.
+/// @return Returns true if the packet tunnel transport has been claimed.
+#[no_mangle]
+pub extern "C" fn leaf_is_packet_tunnel_ready(rt_id: u16) -> bool {
+    leaf::proxy::tun::packet_io::is_packet_tunnel_ready(rt_id)
+}
+
+/// Returns the number of times leaf_reload has completed successfully.
+///
+/// Only incremented after a reload finishes without error (config parsed, all
+/// handlers rebuilt and swapped). Use this to confirm reloads took effect or
+/// to detect reload storms.
+///
+/// @param rt_id The ID of the leaf instance to query.
+/// @return The reload count, or 0 if the runtime is not found.
+#[no_mangle]
+pub extern "C" fn leaf_reload_count(rt_id: u16) -> u32 {
+    leaf::RUNTIME_MANAGER
+        .lock()
+        .unwrap()
+        .get(&rt_id)
+        .map(|m| m.reload_count())
+        .unwrap_or(0)
+}
+
+/// Returns the wall-clock duration of the last leaf_reload call in milliseconds.
+///
+/// This is the total time spent inside reload(), including config parse, router,
+/// dns_client, and outbound_manager write-lock phases. Use this to correlate a
+/// stall with a reload and to measure how long each reload takes over time.
+///
+/// @param rt_id The ID of the leaf instance to query.
+/// @return Milliseconds of the last reload, or 0 if reload has never been called
+///         or the runtime is not found.
+#[no_mangle]
+pub extern "C" fn leaf_last_reload_duration_ms(rt_id: u16) -> u64 {
+    leaf::RUNTIME_MANAGER
+        .lock()
+        .unwrap()
+        .get(&rt_id)
+        .map(|m| m.last_reload_duration_ms())
+        .unwrap_or(0)
+}
+
 /// Initializes a runtime-scoped external packet tunnel for the TUN inbound.
 ///
 /// When this is set up before `leaf_run*`, Leaf will use packet queues instead of
@@ -438,6 +489,38 @@ pub unsafe extern "C" fn leaf_packet_tunnel_read(
         }
         Err(e) => io_to_errno(e),
     }
+}
+
+/// Returns true if the output queue has at least one packet ready to read.
+///
+/// This is a level-triggered check. Unlike the output callback (which is
+/// edge-triggered and fires only on empty→non-empty transitions), this function
+/// can be polled to detect packets that may have been missed if a drain loop
+/// terminated before reaching ERR_NO_DATA.
+///
+/// @param rt_id The runtime ID associated with this packet tunnel.
+/// @return Returns true if packets are available, false otherwise.
+#[no_mangle]
+pub extern "C" fn leaf_packet_tunnel_has_output(rt_id: u16) -> bool {
+    leaf::proxy::tun::packet_io::has_runtime_output_packet(rt_id).unwrap_or(false)
+}
+
+/// Returns the approximate number of bytes queued in the output (Leaf → Swift) direction.
+///
+/// @param rt_id The runtime ID associated with this packet tunnel.
+/// @return Bytes queued, or 0 if the tunnel is not found.
+#[no_mangle]
+pub extern "C" fn leaf_packet_tunnel_output_queued_bytes(rt_id: u16) -> usize {
+    leaf::proxy::tun::packet_io::output_queued_bytes(rt_id).unwrap_or(0)
+}
+
+/// Returns the approximate number of bytes queued in the input (Swift → Leaf) direction.
+///
+/// @param rt_id The runtime ID associated with this packet tunnel.
+/// @return Bytes queued, or 0 if the tunnel is not found.
+#[no_mangle]
+pub extern "C" fn leaf_packet_tunnel_input_queued_bytes(rt_id: u16) -> usize {
+    leaf::proxy::tun::packet_io::input_queued_bytes(rt_id).unwrap_or(0)
 }
 
 /// Closes and removes the external packet tunnel associated with the runtime.

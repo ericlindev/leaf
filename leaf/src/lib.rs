@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::io;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::sync_channel;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -10,7 +11,7 @@ use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio::sync::RwLock;
 use tokio::time::{timeout, Duration};
-use tracing::{info, trace, warn};
+use tracing::{info, info_span, trace, warn, Instrument};
 
 #[cfg(feature = "auto-reload")]
 use notify::{
@@ -79,6 +80,10 @@ pub struct RuntimeManager {
     dns_client: Arc<RwLock<DnsClient>>,
     outbound_manager: Arc<RwLock<OutboundManager>>,
     stat_manager: SyncStatManager,
+    /// Number of times reload() has been called successfully.
+    reload_count: AtomicU32,
+    /// Wall-clock duration of the last reload() call in milliseconds.
+    last_reload_duration_ms: AtomicU64,
     #[cfg(feature = "auto-reload")]
     watcher: Mutex<Option<RecommendedWatcher>>,
 }
@@ -108,6 +113,8 @@ impl RuntimeManager {
             dns_client,
             outbound_manager,
             stat_manager,
+            reload_count: AtomicU32::new(0),
+            last_reload_duration_ms: AtomicU64::new(0),
             #[cfg(feature = "auto-reload")]
             watcher: Mutex::new(None),
         })
@@ -115,6 +122,17 @@ impl RuntimeManager {
 
     pub fn stat_manager(&self) -> SyncStatManager {
         self.stat_manager.clone()
+    }
+
+    /// Number of times reload() has completed successfully.
+    pub fn reload_count(&self) -> u32 {
+        self.reload_count.load(Ordering::Relaxed)
+    }
+
+    /// Wall-clock duration of the last reload() call in milliseconds.
+    /// Returns 0 if reload has never been called.
+    pub fn last_reload_duration_ms(&self) -> u64 {
+        self.last_reload_duration_ms.load(Ordering::Relaxed)
     }
 
     pub async fn health_check_outbound(
@@ -214,8 +232,6 @@ impl RuntimeManager {
             .get_last_peer_active(outbound))
     }
 
-    // This function could block by an in-progress connection dialing.
-    //
     // TODO Reload FakeDns. And perhaps the inbounds as long as the listening
     // addresses haven't changed.
     pub async fn reload(&self) -> Result<(), Error> {
@@ -224,17 +240,107 @@ impl RuntimeManager {
         } else {
             return Err(Error::NoConfigFile);
         };
+
+        let reload_start = std::time::Instant::now();
         info!("reloading from config file: {}", config_path);
-        let mut config = config::from_file(config_path).map_err(Error::Config)?;
+
+        // ── Step 1: Parse config ── (no locks held)
+        let mut config = {
+            let t = std::time::Instant::now();
+            let result = config::from_file(config_path).map_err(Error::Config)?;
+            info!(duration_ms = t.elapsed().as_millis() as u64, "reload: config parsed");
+            result
+        };
+
         app::logger::setup_logger(&config.log)?;
-        self.router.write().await.reload(&mut config.router)?;
-        self.dns_client.write().await.reload(&config.dns)?;
-        self.outbound_manager
-            .write()
+
+        // ── Step 2: Build new Router state ── (no locks held; may open mmdb files)
+        let new_router_state = {
+            let t = std::time::Instant::now();
+            let state = Router::build_new_state(&mut config.router);
+            info!(duration_ms = t.elapsed().as_millis() as u64, "reload: router state built");
+            state
+        };
+
+        // ── Step 3: Build new DnsClient state ── (no locks held)
+        let new_dns_state = {
+            let t = std::time::Instant::now();
+            let state = DnsClient::build_new_state(&config.dns).map_err(Error::Config)?;
+            info!(duration_ms = t.elapsed().as_millis() as u64, "reload: dns state built");
+            state
+        };
+
+        // ── Step 4: Read current selector states ── (read lock only, not write)
+        #[cfg(feature = "outbound-select")]
+        let saved_selections: Option<std::collections::HashMap<String, String>> = Some(
+            self.outbound_manager
+                .read()
+                .await
+                .read_selector_states()
+                .await,
+        );
+        #[cfg(not(feature = "outbound-select"))]
+        #[allow(unused_variables)]
+        let saved_selections: Option<std::collections::HashMap<String, String>> = None;
+
+        // ── Step 5: Build new OutboundManager state ── (no locks held; may be slow)
+        let new_outbound_state = {
+            let t = std::time::Instant::now();
+            let state = OutboundManager::build_new_state(
+                &config.outbounds,
+                self.dns_client.clone(),
+                saved_selections,
+            )
             .await
-            .reload(&config.outbounds, self.dns_client.clone())
-            .await?;
-        info!("reloaded from config file: {}", config_path);
+            .map_err(Error::Config)?;
+            info!(
+                duration_ms = t.elapsed().as_millis() as u64,
+                "reload: outbound state built"
+            );
+            state
+        };
+
+        // ── Step 6: Swap Router ── (write lock held for field assignments only, ~μs)
+        {
+            let t = std::time::Instant::now();
+            self.router
+                .write()
+                .instrument(info_span!("reload.router.swap"))
+                .await
+                .apply_new_state(new_router_state);
+            info!(duration_ms = t.elapsed().as_millis() as u64, "reload: router swapped");
+        }
+
+        // ── Step 7: Swap DnsClient ── (write lock held for field assignments only, ~μs)
+        {
+            let t = std::time::Instant::now();
+            self.dns_client
+                .write()
+                .instrument(info_span!("reload.dns_client.swap"))
+                .await
+                .apply_new_state(new_dns_state);
+            info!(duration_ms = t.elapsed().as_millis() as u64, "reload: dns_client swapped");
+        }
+
+        // ── Step 8: Swap OutboundManager ── (write lock held for field swap + handle abort, ~μs)
+        {
+            let t = std::time::Instant::now();
+            self.outbound_manager
+                .write()
+                .instrument(info_span!("reload.outbound_manager.swap"))
+                .await
+                .apply_new_state(new_outbound_state);
+            info!(
+                duration_ms = t.elapsed().as_millis() as u64,
+                "reload: outbound_manager swapped"
+            );
+        }
+
+        let total_ms = reload_start.elapsed().as_millis() as u64;
+        self.last_reload_duration_ms.store(total_ms, Ordering::Relaxed);
+        self.reload_count.fetch_add(1, Ordering::Relaxed);
+
+        info!(total_ms, "reloaded from config file: {}", config_path);
         Ok(())
     }
 
