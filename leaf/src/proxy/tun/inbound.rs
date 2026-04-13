@@ -1,5 +1,6 @@
+use std::collections::HashSet;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -115,6 +116,7 @@ async fn handle_inbound_datagram_lwip(
     inbound_tag: String,
     nat_manager: Arc<NatManager>,
     fakedns: Option<Arc<FakeDns>>,
+    fake_dns_ips: Arc<HashSet<IpAddr>>,
 ) {
     // The socket to receive/send packets from/to the netstack.
     let (ls, mut lr) = socket.split();
@@ -164,8 +166,13 @@ async fn handle_inbound_datagram_lwip(
                 warn!("Failed to accept a datagram from netstack: {}", e);
             }
             Ok((data, src_addr, dst_addr)) => {
-                // Fake DNS logic.
-                if dst_addr.port() == 53 {
+                // Fake DNS: only intercept queries to the configured
+                // tun-dns-server IPs. Other port-53 traffic (e.g. from
+                // overlay VPN DNS like Tailscale MagicDNS) passes through
+                // as regular UDP so it isn't corrupted by fake responses.
+                if dst_addr.port() == 53
+                    && (fake_dns_ips.is_empty() || fake_dns_ips.contains(&dst_addr.ip()))
+                {
                     if let Some(fakedns) = &fakedns {
                         match fakedns.generate_fake_response(&data).await {
                             Ok(resp) => {
@@ -181,18 +188,6 @@ async fn handle_inbound_datagram_lwip(
                     }
                 }
 
-                // Whether to override the destination according to Fake DNS.
-                //
-                // WARNING
-                //
-                // This allows datagram to have a domain name as destination,
-                // but real UDP traffic are sent with IP address only. If the
-                // outbound for this datagram is a direct one, the outbound
-                // would resolve the domain to IP address before sending out
-                // the datagram. If the outbound is a proxy one, it would
-                // require a proxy server with the ability to handle datagrams
-                // with domain name destination, leaf itself of course supports
-                // this feature very well.
                 let dst_addr = if let Some(fakedns) = &fakedns {
                     if fakedns.is_fake_ip(&dst_addr.ip()).await {
                         if let Some(domain) = fakedns.query_domain(&dst_addr.ip()).await {
@@ -227,6 +222,7 @@ async fn handle_inbound_datagram_smoltcp(
     inbound_tag: String,
     nat_manager: Arc<NatManager>,
     fakedns: Option<Arc<FakeDns>>,
+    fake_dns_ips: Arc<HashSet<IpAddr>>,
 ) {
     // The socket to receive/send packets from/to the netstack.
     let (mut lr, ls) = socket.split();
@@ -277,8 +273,9 @@ async fn handle_inbound_datagram_smoltcp(
     // Accept datagrams from netstack and send to NAT manager.
     while let Some(item) = lr.next().await {
         let (data, src_addr, dst_addr) = item;
-        // Fake DNS logic.
-        if dst_addr.port() == 53 {
+        if dst_addr.port() == 53
+            && (fake_dns_ips.is_empty() || fake_dns_ips.contains(&dst_addr.ip()))
+        {
             if let Some(fakedns) = &fakedns {
                 match fakedns.generate_fake_response(&data).await {
                     Ok(resp) => {
@@ -294,18 +291,6 @@ async fn handle_inbound_datagram_smoltcp(
             }
         }
 
-        // Whether to override the destination according to Fake DNS.
-        //
-        // WARNING
-        //
-        // This allows datagram to have a domain name as destination,
-        // but real UDP traffic are sent with IP address only. If the
-        // outbound for this datagram is a direct one, the outbound
-        // would resolve the domain to IP address before sending out
-        // the datagram. If the outbound is a proxy one, it would
-        // require a proxy server with the ability to handle datagrams
-        // with domain name destination, leaf itself of course supports
-        // this feature very well.
         let dst_addr = if let Some(fakedns) = &fakedns {
             if fakedns.is_fake_ip(&dst_addr.ip()).await {
                 if let Some(domain) = fakedns.query_domain(&dst_addr.ip()).await {
@@ -338,6 +323,7 @@ fn new_lwip<T>(
     dispatcher: Arc<Dispatcher>,
     nat_manager: Arc<NatManager>,
     fakedns: Option<Arc<FakeDns>>,
+    fake_dns_ips: Arc<HashSet<IpAddr>>,
     packet_io: T,
 ) -> Result<Runner>
 where
@@ -415,7 +401,7 @@ where
         // Receive and send UDP packets between netstack and NAT manager. The NAT
         // manager would maintain UDP sessions and send them to the dispatcher.
         futs.push(Box::pin(async move {
-            handle_inbound_datagram_lwip(udp_socket, inbound_tag, nat_manager, fakedns.clone())
+            handle_inbound_datagram_lwip(udp_socket, inbound_tag, nat_manager, fakedns.clone(), fake_dns_ips)
                 .await;
         }));
 
@@ -430,6 +416,7 @@ fn new_smoltcp<T>(
     dispatcher: Arc<Dispatcher>,
     nat_manager: Arc<NatManager>,
     fakedns: Option<Arc<FakeDns>>,
+    fake_dns_ips: Arc<HashSet<IpAddr>>,
     packet_io: T,
 ) -> Result<Runner>
 where
@@ -518,7 +505,7 @@ where
         // Receive and send UDP packets between netstack and NAT manager. The NAT
         // manager would maintain UDP sessions and send them to the dispatcher.
         futs.push(Box::pin(async move {
-            handle_inbound_datagram_smoltcp(udp_socket, inbound_tag, nat_manager, fakedns.clone())
+            handle_inbound_datagram_smoltcp(udp_socket, inbound_tag, nat_manager, fakedns.clone(), fake_dns_ips)
                 .await;
         }));
 
@@ -553,6 +540,18 @@ pub fn new(
         FakeDns::from_proto_settings(settings.fake_dns_exclude, settings.fake_dns_include)
             .map_err(|e| anyhow!("invalid fake DNS configuration: {}", e))?;
 
+    // Build the set of IPs that should trigger fake-DNS interception.
+    // Only DNS queries to these IPs (the tun-dns-server addresses) are
+    // intercepted; port-53 traffic to other IPs (e.g. Tailscale MagicDNS
+    // upstream) passes through as regular UDP.
+    let fake_dns_ips: Arc<HashSet<IpAddr>> = Arc::new(
+        settings
+            .dns_servers
+            .iter()
+            .filter_map(|s| s.parse::<IpAddr>().ok())
+            .collect(),
+    );
+
     // Validate feature availability before consuming the packet tunnel transport.
     if super::packet_io::has_runtime_packet_tunnel(rt_id) {
         #[cfg(not(feature = "netstack-smoltcp"))]
@@ -585,7 +584,7 @@ pub fn new(
             "smoltcp" => {
                 #[cfg(feature = "netstack-smoltcp")]
                 {
-                    new_smoltcp(inbound, dispatcher, nat_manager, fakedns, packet_tunnel)
+                    new_smoltcp(inbound, dispatcher, nat_manager, fakedns, fake_dns_ips.clone(), packet_tunnel)
                 }
                 #[cfg(not(feature = "netstack-smoltcp"))]
                 {
@@ -595,7 +594,7 @@ pub fn new(
             _ => {
                 #[cfg(feature = "netstack-lwip")]
                 {
-                    new_lwip(inbound, dispatcher, nat_manager, fakedns, packet_tunnel)
+                    new_lwip(inbound, dispatcher, nat_manager, fakedns, fake_dns_ips.clone(), packet_tunnel)
                 }
                 #[cfg(not(feature = "netstack-lwip"))]
                 {
@@ -669,13 +668,13 @@ pub fn new(
     match settings.tun2socks.as_str() {
         "smoltcp" => {
             #[cfg(feature = "netstack-smoltcp")]
-            return new_smoltcp(inbound, dispatcher, nat_manager, fakedns, tun.into_framed());
+            return new_smoltcp(inbound, dispatcher, nat_manager, fakedns, fake_dns_ips.clone(), tun.into_framed());
             #[cfg(not(feature = "netstack-smoltcp"))]
             return Err(anyhow!("netstack-smoltcp feature is not enabled"));
         }
         _ => {
             #[cfg(feature = "netstack-lwip")]
-            return new_lwip(inbound, dispatcher, nat_manager, fakedns, tun.into_framed());
+            return new_lwip(inbound, dispatcher, nat_manager, fakedns, fake_dns_ips.clone(), tun.into_framed());
             #[cfg(not(feature = "netstack-lwip"))]
             return Err(anyhow!("netstack-lwip feature is not enabled"));
         }

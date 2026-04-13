@@ -5,7 +5,6 @@ use anyhow::anyhow;
 use anyhow::Result;
 use async_recursion::async_recursion;
 use cidr::IpCidr;
-use futures::TryFutureExt;
 use maxminddb::geoip2::Country;
 use maxminddb::Mmap;
 #[cfg(feature = "rule-process-name")]
@@ -596,29 +595,28 @@ impl Router {
             }
         }
         if effective_dest.is_domain() && self.domain_resolve && !sess.skip_resolve {
-            debug!("resolve routing domain={:?}", effective_dest.domain());
-            let ips = {
-                self.dns_client
-                    .read()
-                    .await
-                    .lookup(
-                        effective_dest
-                            .domain()
-                            .ok_or_else(|| anyhow!("illegal domain name"))?,
-                    )
-                    .map_err(|e| anyhow!("lookup failed: {}", e))
-                    .await?
-            };
-            if !ips.is_empty() {
-                let mut new_sess = sess.clone();
-                new_sess.destination = SocksAddr::from((ips[0], effective_dest.port()));
-                new_sess.dns_sniffed_domain = None;
-                new_sess.tls_sniffed_domain = None;
-                new_sess.http_sniffed_domain = None;
-                debug!("re-matching with resolved ip={}", ips[0]);
-                for rule in &self.rules {
-                    if rule.apply(&new_sess) {
-                        return Ok(Some(&rule.target));
+            if let Some(domain) = effective_dest.domain() {
+                debug!("resolve routing domain={:?}", domain);
+                match self.dns_client.read().await.lookup(domain).await {
+                    Ok(ips) if !ips.is_empty() => {
+                        let mut new_sess = sess.clone();
+                        new_sess.destination =
+                            SocksAddr::from((ips[0], effective_dest.port()));
+                        new_sess.dns_sniffed_domain = None;
+                        new_sess.tls_sniffed_domain = None;
+                        new_sess.http_sniffed_domain = None;
+                        debug!("re-matching with resolved ip={}", ips[0]);
+                        for rule in &self.rules {
+                            if rule.apply(&new_sess) {
+                                return Ok(Some(&rule.target));
+                            }
+                        }
+                    }
+                    Ok(_) => {
+                        warn!("routing resolve returned empty for {:?}", domain);
+                    }
+                    Err(e) => {
+                        warn!("routing resolve failed for {:?}: {}, falling through", domain, e);
                     }
                 }
             }
